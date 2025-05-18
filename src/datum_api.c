@@ -1620,6 +1620,10 @@ enum MHD_Result datum_api_answer(void *cls, struct MHD_Connection *connection, c
 	if (strcmp(method, "POST") == 0) {
 		int_method = 2;
 	}
+
+	if (strcmp(url, "/api/clients.json") == 0 && int_method == 1) {
+		return datum_api_clients_json(connection);
+	}
 	
 	if (!int_method) {
 		const char *error_response = "<H1>Method not allowed.</H1>";
@@ -1769,6 +1773,61 @@ enum MHD_Result datum_api_answer(void *cls, struct MHD_Connection *connection, c
 	ret = MHD_queue_response (connection, MHD_HTTP_NOT_FOUND, response);
 	MHD_destroy_response (response);
 	return ret;
+}
+
+int datum_api_clients_json(struct MHD_Connection *connection) {
+    json_t *clients = json_array();
+    uint64_t tsms = current_time_millis();
+    int max_threads = global_stratum_app ? global_stratum_app->max_threads : 0;
+
+    for (int j = 0; j < max_threads; ++j) {
+        for (int i = 0; i < global_stratum_app->max_clients_thread; ++i) {
+            if (global_stratum_app->datum_threads[j].client_data[i].fd <= 0)
+                continue;
+
+            T_DATUM_MINER_DATA *m = global_stratum_app->datum_threads[j].client_data[i].app_client_data;
+            if (!m) continue;
+
+            json_t *client = json_object();
+            json_object_set_new(client, "thread", json_integer(j));
+            json_object_set_new(client, "cid", json_integer(i));
+            json_object_set_new(client, "host", json_string(global_stratum_app->datum_threads[j].client_data[i].rem_host));
+            json_object_set_new(client, "username", json_string(m->last_auth_username));
+            json_object_set_new(client, "useragent", json_string(m->useragent));
+            json_object_set_new(client, "subscribed", json_boolean(m->subscribed));
+
+            if (m->subscribed) {
+                json_object_set_new(client, "subscribe_secs", json_real((tsms - m->subscribe_tsms) / 1000.0));
+                json_object_set_new(client, "diff", json_integer(m->current_diff));
+                json_object_set_new(client, "accepted_diff", json_integer(m->share_diff_accepted));
+                json_object_set_new(client, "rejected_diff", json_integer(m->share_diff_rejected));
+                json_object_set_new(client, "accepted_shares", json_integer(m->share_count_accepted));
+                json_object_set_new(client, "rejected_shares", json_integer(m->share_count_rejected));
+
+		double hr_ths = 0.0;
+		uint64_t window_ms   = m->stats.last_swap_ms;
+		uint64_t window_diff = m->stats.diff_accepted[!m->stats.active_index];
+		
+		if (window_ms > 0 && window_diff > 0) {
+			double window_secs = (double)window_ms / 1000.0;
+			/* TH/s = (diff / s) × 2^32 / 1e12 */
+			hr_ths = (window_diff / window_secs) * 0.004294967296;
+		}
+		json_object_set_new(client, "hashrate_ths", json_real(hr_ths));
+            }
+
+            json_array_append_new(clients, client);
+        }
+    }
+
+    char *json_str = json_dumps(clients, JSON_COMPACT);
+    json_decref(clients);
+
+    struct MHD_Response *response = MHD_create_response_from_buffer(strlen(json_str), json_str, MHD_RESPMEM_MUST_FREE);
+    MHD_add_response_header(response, "Content-Type", "application/json");
+    int ret = MHD_queue_response(connection, MHD_HTTP_OK, response);
+    MHD_destroy_response(response);
+    return ret;
 }
 
 static struct MHD_Daemon *datum_api_try_start(unsigned int flags, const int sock) {
